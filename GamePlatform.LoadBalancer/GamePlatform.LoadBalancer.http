@@ -1,0 +1,6 @@
+@GamePlatform.LoadBalancer_HostAddress = http://localhost:5244
+
+GET {{GamePlatform.LoadBalancer_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

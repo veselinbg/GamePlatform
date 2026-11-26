@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="GamePlatform.GameServer/GamePlatform.GameServer.csproj" />
+  <Project Path="GamePlatform.LoadBalancer/GamePlatform.LoadBalancer.csproj" />
+  <Project Path="GamePlatform.Tests/GamePlatform.Tests.csproj" />
+</Solution>

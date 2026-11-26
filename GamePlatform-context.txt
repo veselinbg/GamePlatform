@@ -1,0 +1,1797 @@
+================================================================================
+CODE COLLETOR - PROJECT CONTEXT
+================================================================================
+
+Generated: 2026-09-12 14:50:37
+Root:      D:\Development\Projects\Betty\GamePlatform\GamePlatform
+Files:     33
+
+================================================================================
+FILE LIST
+================================================================================
+
+1. GamePlatform.GameServer\Api\Controllers\BetsController.cs
+2. GamePlatform.GameServer\Api\Controllers\WalletsController.cs
+3. GamePlatform.GameServer\Application\Bets\BetResult.cs
+4. GamePlatform.GameServer\Application\Bets\PlaceBetRequest.cs
+5. GamePlatform.GameServer\Application\Bets\PlaceBetService.cs
+6. GamePlatform.GameServer\appsettings.Development.json
+7. GamePlatform.GameServer\appsettings.json
+8. GamePlatform.GameServer\Domain\Bet.cs
+9. GamePlatform.GameServer\Domain\Enums\BetStatus.cs
+10. GamePlatform.GameServer\Domain\Enums\LedgerTransactionType.cs
+11. GamePlatform.GameServer\Domain\Enums\WalletType.cs
+12. GamePlatform.GameServer\Domain\IdempotencyRecord.cs
+13. GamePlatform.GameServer\Domain\LedgerEntry.cs
+14. GamePlatform.GameServer\Domain\Wallet.cs
+15. GamePlatform.GameServer\GamePlatform.GameServer.csproj
+16. GamePlatform.GameServer\Health\DatabaseReadinessCheck.cs
+17. GamePlatform.GameServer\Infrastructure\Persistence\GameDbContext.cs
+18. GamePlatform.GameServer\Infrastructure\Transactions\FinancialTransactionExecutor.cs
+19. GamePlatform.GameServer\Program.cs
+20. GamePlatform.GameServer\Properties\launchSettings.json
+21. GamePlatform.LoadBalancer\appsettings.Development.json
+22. GamePlatform.LoadBalancer\appsettings.json
+23. GamePlatform.LoadBalancer\Configuration\GameServerOptions.cs
+24. GamePlatform.LoadBalancer\GamePlatform.LoadBalancer.csproj
+25. GamePlatform.LoadBalancer\Health\ServerHealthMonitor.cs
+26. GamePlatform.LoadBalancer\Health\ServerState.cs
+27. GamePlatform.LoadBalancer\Program.cs
+28. GamePlatform.LoadBalancer\Properties\launchSettings.json
+29. GamePlatform.LoadBalancer\Proxy\ProxyController.cs
+30. GamePlatform.LoadBalancer\Routing\RoundRobinServerSelector.cs
+31. GamePlatform.Tests\Concurrency\WalletConcurrencyTests.cs
+32. GamePlatform.Tests\GamePlatform.Tests.csproj
+33. GamePlatform.Tests\UnitTest1.cs
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Api\Controllers\BetsController.cs
+================================================================================
+
+using GamePlatform.GameServer.Application.Bets;
+using Microsoft.AspNetCore.Mvc;
+
+namespace GamePlatform.GameServer.Api.Controllers;
+
+[ApiController]
+[Route("api/bets")]
+public sealed class BetsController : ControllerBase
+{
+    private readonly PlaceBetService _service;
+    private readonly ILogger<BetsController> _logger;
+
+    public BetsController(
+        PlaceBetService service,
+        ILogger<BetsController> logger)
+    {
+        _service = service;
+        _logger = logger;
+    }
+
+    [HttpPost]
+    public async Task<IActionResult> PlaceBet(
+        [FromBody] PlaceBetRequest request,
+        CancellationToken cancellationToken)
+    {
+        var requestId =
+            Request.Headers["X-Request-Id"].FirstOrDefault()
+            ?? Guid.NewGuid().ToString("N");
+
+        var idempotencyKey =
+            Request.Headers["Idempotency-Key"].FirstOrDefault();
+
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            return BadRequest(new
+            {
+                error = "Idempotency-Key header is required.",
+                requestId
+            });
+        }
+
+        try
+        {
+            var result = await _service.ExecuteAsync(
+                request,
+                idempotencyKey,
+                cancellationToken);
+
+            _logger.LogInformation(
+                "Bet processed. RequestId={RequestId}, BetId={BetId}, OperationId={OperationId}",
+                requestId,
+                result.BetId,
+                result.OperationId);
+
+            return Ok(result);
+        }
+        catch (InsufficientBalanceException ex)
+        {
+            return Conflict(new
+            {
+                error = ex.Message,
+                requestId,
+                walletId = ex.WalletId
+            });
+        }
+        catch (KeyNotFoundException ex)
+        {
+            return NotFound(new
+            {
+                error = ex.Message,
+                requestId
+            });
+        }
+        catch (ArgumentException ex)
+        {
+            return BadRequest(new
+            {
+                error = ex.Message,
+                requestId
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Conflict(new
+            {
+                error = ex.Message,
+                requestId
+            });
+        }
+
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Api\Controllers\WalletsController.cs
+================================================================================
+
+using GamePlatform.GameServer.Domain;
+using GamePlatform.GameServer.Domain.Enums;
+using GamePlatform.GameServer.Infrastructure.Persistence;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace GamePlatform.GameServer.Api.Controllers;
+
+[ApiController]
+[Route("api/wallets")]
+public sealed class WalletsController : ControllerBase
+{
+    private readonly GameDbContext _db;
+
+    public WalletsController(GameDbContext db)
+    {
+        _db = db;
+    }
+
+    [HttpGet("{walletId:guid}/balance/verify")]
+    public async Task<IActionResult> VerifyBalance(
+        Guid walletId,
+        CancellationToken cancellationToken)
+    {
+        var wallet = await _db.Wallets
+            .SingleOrDefaultAsync(x => x.Id == walletId, cancellationToken);
+
+        if (wallet is null)
+            return NotFound();
+
+        var ledgerBalance = await _db.LedgerEntries
+            .Where(x => x.WalletId == walletId)
+            .SumAsync(x => (decimal?)x.Amount, cancellationToken) ?? 0m;
+
+        return Ok(new
+        {
+            walletId,
+            walletBalance = wallet.Balance,
+            ledgerBalance,
+            consistent = wallet.Balance == ledgerBalance,
+            version = wallet.Version
+        });
+    }
+    [HttpPost]
+    public async Task<IActionResult> Create(
+           [FromBody] CreateWalletRequest request,
+           CancellationToken cancellationToken)
+    {
+        if (request.Id == Guid.Empty)
+        {
+            return BadRequest(new
+            {
+                error = "Wallet id is required."
+            });
+        }
+
+        if (request.Balance < 0)
+        {
+            return BadRequest(new
+            {
+                error = "Initial balance cannot be negative."
+            });
+        }
+
+        var existing =
+            await _db.Wallets
+                .AsNoTracking()
+                .FirstOrDefaultAsync(
+                    x => x.Id == request.Id,
+                    cancellationToken);
+
+        if (existing is not null)
+        {
+            return Conflict(new
+            {
+                error = "Wallet already exists.",
+                walletId = existing.Id
+            });
+        }
+
+        await using var transaction =
+            await _db.Database.BeginTransactionAsync(
+                cancellationToken);
+
+        var wallet = new Wallet
+        {
+            Id = request.Id,
+            Balance = request.Balance,
+            Type = Enum.TryParse<WalletType>(request.Type, true, out var walletType)
+    ? walletType
+    : WalletType.Player,
+            Version = 1,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        _db.Wallets.Add(wallet);
+
+        /*
+         * The initial balance must also exist in the ledger.
+         * Otherwise the wallet projection cannot be reconciled
+         * against the ledger.
+         */
+        if (request.Balance > 0)
+        {
+            _db.LedgerEntries.Add(
+                new LedgerEntry
+                {
+                    Id = Guid.NewGuid(),
+                    WalletId = wallet.Id,
+                    Amount = request.Balance,
+                    TransactionType =
+                        Domain.Enums.LedgerTransactionType.Deposit,
+                    OperationId =
+                        $"wallet-init-{wallet.Id:N}",
+                    IdempotencyKey =
+                        $"wallet-init-{wallet.Id:N}",
+                    CreatedAt = DateTime.UtcNow
+                });
+        }
+
+        await _db.SaveChangesAsync(cancellationToken);
+
+        await transaction.CommitAsync(cancellationToken);
+
+        return Created(
+            $"/api/wallets/{wallet.Id}",
+            new
+            {
+                wallet.Id,
+                wallet.Balance,
+                wallet.Type,
+                wallet.Version
+            });
+    }
+
+    [HttpGet("{id:guid}")]
+    public async Task<IActionResult> Get(
+        Guid id,
+        CancellationToken cancellationToken)
+    {
+        var wallet =
+            await _db.Wallets
+                .AsNoTracking()
+                .FirstOrDefaultAsync(
+                    x => x.Id == id,
+                    cancellationToken);
+
+        if (wallet is null)
+        {
+            return NotFound();
+        }
+
+        return Ok(new
+        {
+            wallet.Id,
+            wallet.Balance,
+            wallet.Type,
+            wallet.Version
+        });
+    }
+}
+
+public sealed class CreateWalletRequest
+{
+    public Guid Id { get; set; }
+
+    public decimal Balance { get; set; }
+
+    public string? Type { get; set; }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Application\Bets\BetResult.cs
+================================================================================
+
+namespace GamePlatform.GameServer.Application.Bets;
+
+public sealed record BetResult(
+    Guid BetId,
+    Guid WalletId,
+    decimal Amount,
+    decimal Balance,
+    string OperationId,
+    string Status);
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Application\Bets\PlaceBetRequest.cs
+================================================================================
+
+namespace GamePlatform.GameServer.Application.Bets;
+
+public sealed record PlaceBetRequest(
+    Guid WalletId,
+    decimal Amount);
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Application\Bets\PlaceBetService.cs
+================================================================================
+
+using System.Text.Json;
+using GamePlatform.GameServer.Domain;
+using GamePlatform.GameServer.Domain.Enums;
+using GamePlatform.GameServer.Infrastructure.Persistence;
+using GamePlatform.GameServer.Infrastructure.Transactions;
+using Microsoft.EntityFrameworkCore;
+
+namespace GamePlatform.GameServer.Application.Bets;
+
+public sealed class PlaceBetService
+{
+    private readonly FinancialTransactionExecutor _transactions;
+    private readonly ILogger<PlaceBetService> _logger;
+
+    public PlaceBetService(
+        FinancialTransactionExecutor transactions,
+        ILogger<PlaceBetService> logger)
+    {
+        _transactions = transactions;
+        _logger = logger;
+    }
+
+    public async Task<BetResult> ExecuteAsync(
+        PlaceBetRequest request,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            throw new ArgumentException(
+                "Idempotency-Key is required.");
+        }
+
+        if (request.Amount <= 0)
+        {
+            throw new ArgumentException(
+                "Bet amount must be greater than zero.");
+        }
+
+        return await _transactions.ExecuteAsync(
+            async (db, ct) =>
+            {
+                /*
+                 * IMPORTANT:
+                 *
+                 * The idempotency record is checked inside the
+                 * same financial transaction as the wallet update.
+                 *
+                 * The database UNIQUE constraint on IdempotencyKey
+                 * is the final authority when two different
+                 * Game Server processes race.
+                 */
+
+                var existing =
+                    await db.IdempotencyRecords
+                        .AsNoTracking()
+                        .SingleOrDefaultAsync(
+                            x => x.IdempotencyKey == idempotencyKey,
+                            ct);
+
+                if (existing is not null)
+                {
+                    var existingResult =
+                        JsonSerializer.Deserialize<BetResult>(
+                            existing.ResponsePayload);
+
+                    if (existingResult is null)
+                    {
+                        throw new InvalidOperationException(
+                            "Stored idempotency result is invalid.");
+                    }
+
+                    _logger.LogInformation(
+                        "Returning existing idempotent result. " +
+                        "IdempotencyKey={IdempotencyKey}, " +
+                        "OperationId={OperationId}",
+                        idempotencyKey,
+                        existing.OperationId);
+
+                    return existingResult;
+                }
+
+                /*
+                 * Load the wallet as a tracked entity.
+                 *
+                 * Version is configured as an EF Core concurrency
+                 * token. EF will therefore include the original
+                 * Version value in the UPDATE WHERE clause.
+                 */
+
+                var wallet =
+                    await db.Wallets
+                        .SingleOrDefaultAsync(
+                            x => x.Id == request.WalletId,
+                            ct);
+
+                if (wallet is null)
+                {
+                    throw new KeyNotFoundException(
+                        "Wallet not found.");
+                }
+
+                if (wallet.Balance < request.Amount)
+                {
+                    throw new InsufficientBalanceException(
+                        wallet.Id,
+                        request.Amount,
+                        wallet.Balance);
+                }
+
+                var operationId =
+                    Guid.NewGuid().ToString("N");
+
+                var now = DateTime.UtcNow;
+
+                var bet = new Bet
+                {
+                    Id = Guid.NewGuid(),
+                    WalletId = wallet.Id,
+                    Amount = request.Amount,
+                    OperationId = operationId,
+                    Status = BetStatus.Accepted,
+                    CreatedAt = now
+                };
+
+                var ledger = new LedgerEntry
+                {
+                    Id = Guid.NewGuid(),
+                    WalletId = wallet.Id,
+                    Amount = -request.Amount,
+                    TransactionType =
+                        LedgerTransactionType.Bet,
+                    OperationId = operationId,
+                    IdempotencyKey = idempotencyKey,
+                    CreatedAt = now
+                };
+
+                /*
+                 * Update the balance projection.
+                 *
+                 * The original wallet.Version is retained by EF
+                 * as the concurrency value.
+                 */
+
+                wallet.Balance -= request.Amount;
+                wallet.Version++;
+                wallet.UpdatedAt = now;
+
+                db.Bets.Add(bet);
+                db.LedgerEntries.Add(ledger);
+
+                var result = new BetResult(
+                    bet.Id,
+                    wallet.Id,
+                    request.Amount,
+                    wallet.Balance,
+                    operationId,
+                    bet.Status.ToString());
+
+                db.IdempotencyRecords.Add(
+                    new IdempotencyRecord
+                    {
+                        Id = Guid.NewGuid(),
+                        IdempotencyKey = idempotencyKey,
+                        OperationId = operationId,
+                        Status = "Completed",
+                        ResponsePayload =
+                            JsonSerializer.Serialize(result),
+                        CreatedAt = now,
+                        CompletedAt = now
+                    });
+
+                return result;
+            },
+            cancellationToken);
+    }
+}
+
+public sealed class InsufficientBalanceException : Exception
+{
+    public Guid WalletId { get; }
+
+    public decimal RequestedAmount { get; }
+
+    public decimal AvailableBalance { get; }
+
+    public InsufficientBalanceException(
+        Guid walletId,
+        decimal requestedAmount,
+        decimal availableBalance)
+        : base("Insufficient wallet balance.")
+    {
+        WalletId = walletId;
+        RequestedAmount = requestedAmount;
+        AvailableBalance = availableBalance;
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\appsettings.Development.json
+================================================================================
+
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\appsettings.json
+================================================================================
+
+{
+  "ConnectionStrings": {
+    "GameDatabase": "Data Source=game.db;Cache=Shared"
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning",
+      "Microsoft.EntityFrameworkCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*"
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Domain\Bet.cs
+================================================================================
+
+using GamePlatform.GameServer.Domain.Enums;
+
+namespace GamePlatform.GameServer.Domain;
+
+public sealed class Bet
+{
+    public Guid Id { get; set; }
+
+    public Guid WalletId { get; set; }
+
+    public decimal Amount { get; set; }
+
+    public string OperationId { get; set; } = null!;
+
+    public BetStatus Status { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+
+    public Wallet Wallet { get; set; } = null!;
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Domain\Enums\BetStatus.cs
+================================================================================
+
+namespace GamePlatform.GameServer.Domain.Enums;
+
+public enum BetStatus
+{
+    Accepted = 1,
+    Rejected = 2
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Domain\Enums\LedgerTransactionType.cs
+================================================================================
+
+namespace GamePlatform.GameServer.Domain.Enums;
+
+public enum LedgerTransactionType
+{
+    Deposit = 1,
+    Bet = 2,
+    Win = 3,
+    Adjustment = 4
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Domain\Enums\WalletType.cs
+================================================================================
+
+namespace GamePlatform.GameServer.Domain.Enums;
+
+public enum WalletType
+{
+    Player = 1
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Domain\IdempotencyRecord.cs
+================================================================================
+
+namespace GamePlatform.GameServer.Domain;
+
+public sealed class IdempotencyRecord
+{
+    public Guid Id { get; set; }
+
+    public string IdempotencyKey { get; set; } = null!;
+
+    public string OperationId { get; set; } = null!;
+
+    public string Status { get; set; } = null!;
+
+    public string ResponsePayload { get; set; } = null!;
+
+    public DateTime CreatedAt { get; set; }
+
+    public DateTime? CompletedAt { get; set; }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Domain\LedgerEntry.cs
+================================================================================
+
+using GamePlatform.GameServer.Domain.Enums;
+
+namespace GamePlatform.GameServer.Domain;
+
+public sealed class LedgerEntry
+{
+    public Guid Id { get; set; }
+
+    public Guid WalletId { get; set; }
+
+    public decimal Amount { get; set; }
+
+    public LedgerTransactionType TransactionType { get; set; }
+
+    public string OperationId { get; set; } = null!;
+
+    public string IdempotencyKey { get; set; } = null!;
+
+    public DateTime CreatedAt { get; set; }
+
+    public Wallet Wallet { get; set; } = null!;
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Domain\Wallet.cs
+================================================================================
+
+using GamePlatform.GameServer.Domain.Enums;
+
+namespace GamePlatform.GameServer.Domain;
+
+public sealed class Wallet
+{
+    public Guid Id { get; set; }
+
+    public decimal Balance { get; set; }
+
+    public WalletType Type { get; set; }
+
+    public long Version { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+
+    public DateTime UpdatedAt { get; set; }
+
+    public ICollection<LedgerEntry> LedgerEntries { get; set; } = new List<LedgerEntry>();
+
+    public ICollection<Bet> Bets { get; set; } = new List<Bet>();
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\GamePlatform.GameServer.csproj
+================================================================================
+
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.12">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.12" />
+  </ItemGroup>
+
+</Project>
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Health\DatabaseReadinessCheck.cs
+================================================================================
+
+using GamePlatform.GameServer.Infrastructure.Persistence;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+
+namespace GamePlatform.GameServer.Health;
+
+public sealed class DatabaseReadinessCheck : IHealthCheck
+{
+    private readonly GameDbContext _db;
+
+    public DatabaseReadinessCheck(GameDbContext db)
+    {
+        _db = db;
+    }
+
+    public async Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var healthy =
+                await _db.Database.CanConnectAsync(cancellationToken);
+
+            return healthy
+                ? HealthCheckResult.Healthy()
+                : HealthCheckResult.Unhealthy("Database unavailable.");
+        }
+        catch (Exception ex)
+        {
+            return HealthCheckResult.Unhealthy(
+                "Database unavailable.",
+                ex);
+        }
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Infrastructure\Persistence\GameDbContext.cs
+================================================================================
+
+using GamePlatform.GameServer.Domain;
+using Microsoft.EntityFrameworkCore;
+
+namespace GamePlatform.GameServer.Infrastructure.Persistence;
+
+public sealed class GameDbContext : DbContext
+{
+    public GameDbContext(DbContextOptions<GameDbContext> options)
+        : base(options)
+    {
+    }
+
+    public DbSet<Wallet> Wallets => Set<Wallet>();
+
+    public DbSet<Bet> Bets => Set<Bet>();
+
+    public DbSet<LedgerEntry> LedgerEntries => Set<LedgerEntry>();
+
+    public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        modelBuilder.Entity<Wallet>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+
+            entity.Property(x => x.Balance)
+                .HasPrecision(18, 2);
+
+            entity.Property(x => x.Version)
+                 .IsConcurrencyToken()
+                 .ValueGeneratedNever();
+
+            entity.Property(x => x.Type)
+                .IsRequired();
+
+            entity.HasIndex(x => x.Id);
+        });
+
+        modelBuilder.Entity<Bet>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+
+            entity.Property(x => x.Amount)
+                .HasPrecision(18, 2);
+
+            entity.Property(x => x.OperationId)
+                .IsRequired();
+
+            entity.HasIndex(x => x.OperationId)
+                .IsUnique();
+
+            entity.HasOne(x => x.Wallet)
+                .WithMany(x => x.Bets)
+                .HasForeignKey(x => x.WalletId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<LedgerEntry>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+
+            entity.Property(x => x.Amount)
+                .HasPrecision(18, 2);
+
+            entity.Property(x => x.OperationId)
+                .IsRequired();
+
+            entity.Property(x => x.IdempotencyKey)
+                .IsRequired();
+
+            entity.HasIndex(x => x.OperationId)
+                .IsUnique();
+
+            entity.HasIndex(x => x.IdempotencyKey)
+                .IsUnique();
+
+            entity.HasOne(x => x.Wallet)
+                .WithMany(x => x.LedgerEntries)
+                .HasForeignKey(x => x.WalletId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<IdempotencyRecord>(entity =>
+        {
+            entity.HasKey(x => x.Id);
+
+            entity.Property(x => x.IdempotencyKey)
+                .IsRequired();
+
+            entity.Property(x => x.OperationId)
+                .IsRequired();
+
+            entity.HasIndex(x => x.IdempotencyKey)
+                .IsUnique();
+        });
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Infrastructure\Transactions\FinancialTransactionExecutor.cs
+================================================================================
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
+
+namespace GamePlatform.GameServer.Infrastructure.Transactions;
+
+public sealed class FinancialTransactionExecutor
+{
+    private readonly IDbContextFactory<Persistence.GameDbContext> _factory;
+    private readonly ILogger<FinancialTransactionExecutor> _logger;
+
+    public FinancialTransactionExecutor(
+        IDbContextFactory<Persistence.GameDbContext> factory,
+        ILogger<FinancialTransactionExecutor> logger)
+    {
+        _factory = factory;
+        _logger = logger;
+    }
+
+    public async Task<T> ExecuteAsync<T>(
+        Func<Persistence.GameDbContext, CancellationToken, Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        const int maxAttempts = 5;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            await using var db = await _factory.CreateDbContextAsync(cancellationToken);
+
+            await using var transaction =
+                await db.Database.BeginTransactionAsync(
+                    System.Data.IsolationLevel.ReadCommitted,
+                    cancellationToken);
+
+            try
+            {
+                var result = await operation(db, cancellationToken);
+
+                await db.SaveChangesAsync(cancellationToken);
+
+                await transaction.CommitAsync(cancellationToken);
+
+                return result;
+            }
+            catch (DbUpdateConcurrencyException ex) when (attempt < maxAttempts)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+
+                _logger.LogWarning(
+                    ex,
+                    "Optimistic concurrency conflict. Attempt {Attempt}/{MaxAttempts}",
+                    attempt,
+                    maxAttempts);
+
+                await Task.Delay(
+                    TimeSpan.FromMilliseconds(25 * attempt),
+                    cancellationToken);
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException ex)
+                when ((ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6)
+                       && attempt < maxAttempts)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+
+                _logger.LogWarning(
+                    ex,
+                    "SQLite busy/locked. Attempt {Attempt}/{MaxAttempts}",
+                    attempt,
+                    maxAttempts);
+
+                await Task.Delay(
+                    TimeSpan.FromMilliseconds(50 * attempt),
+                    cancellationToken);
+            }
+        }
+
+        throw new InvalidOperationException(
+            "Financial transaction failed after maximum retry attempts.");
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Program.cs
+================================================================================
+
+using GamePlatform.GameServer.Application.Bets;
+using GamePlatform.GameServer.Health;
+using GamePlatform.GameServer.Infrastructure.Persistence;
+using GamePlatform.GameServer.Infrastructure.Transactions;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+
+var connectionString =
+    builder.Configuration.GetConnectionString("GameDatabase")
+    ?? "Data Source=game.db;Cache=Shared";
+
+builder.Services.AddDbContext<GameDbContext>(options =>
+{
+    options.UseSqlite(connectionString);
+});
+
+builder.Services.AddDbContextFactory<GameDbContext>(options =>
+{
+    options.UseSqlite(connectionString);
+});
+
+builder.Services.AddScoped<PlaceBetService>();
+builder.Services.AddScoped<FinancialTransactionExecutor>();
+
+builder.Services
+    .AddHealthChecks()
+    .AddCheck<DatabaseReadinessCheck>(
+        "database",
+        HealthStatus.Unhealthy);
+
+var app = builder.Build();
+
+app.Use(async (context, next) =>
+{
+    var requestId =
+        context.Request.Headers["X-Request-Id"].FirstOrDefault()
+        ?? Guid.NewGuid().ToString("N");
+
+    context.Response.Headers["X-Request-Id"] = requestId;
+
+    using var scope = app.Logger.BeginScope(
+        new Dictionary<string, object>
+        {
+            ["RequestId"] = requestId,
+            ["ServerInstance"] =
+                Environment.GetEnvironmentVariable("GAME_SERVER_NAME")
+                ?? "unknown"
+        });
+
+    await next();
+});
+
+app.MapControllers();
+
+app.MapHealthChecks(
+    "/health/live",
+    new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+    {
+        Predicate = _ => false
+    });
+
+app.MapHealthChecks(
+    "/health/ready",
+    new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+    {
+        Predicate = _ => true
+    });
+
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<GameDbContext>();
+
+    await db.Database.EnsureCreatedAsync();
+
+    await db.Database.ExecuteSqlRawAsync(
+        "PRAGMA journal_mode = WAL;");
+
+    await db.Database.ExecuteSqlRawAsync(
+        "PRAGMA busy_timeout = 5000;");
+}
+
+app.Run();
+
+public partial class Program;
+
+
+================================================================================
+FILE: GamePlatform.GameServer\Properties\launchSettings.json
+================================================================================
+
+{
+  "$schema": "http://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "GameServer": {
+      "commandName": "Project",
+      "applicationUrl": "http://localhost:6001",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "GAME_SERVER_NAME": "GameServer1"
+      }
+    }
+  }
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\appsettings.Development.json
+================================================================================
+
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  }
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\appsettings.json
+================================================================================
+
+{
+  "GameServers": [
+    {
+      "Name": "GameServer1",
+      "BaseUrl": "http://localhost:6001"
+    },
+    {
+      "Name": "GameServer2",
+      "BaseUrl": "http://localhost:6002"
+    },
+    {
+      "Name": "GameServer3",
+      "BaseUrl": "http://localhost:6003"
+    },
+    {
+      "Name": "GameServer4",
+      "BaseUrl": "http://localhost:6004"
+    },
+    {
+      "Name": "GameServer5",
+      "BaseUrl": "http://localhost:6005"
+    }
+  ],
+  "LoadBalancer": {
+    "RequestTimeoutSeconds": 10,
+    "HealthCheckIntervalSeconds": 5,
+    "Strategy": "RoundRobin"
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  }
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\Configuration\GameServerOptions.cs
+================================================================================
+
+namespace GamePlatform.LoadBalancer.Configuration;
+
+public sealed class GameServerOptions
+{
+    public List<GameServerEndpoint> GameServers { get; set; } = [];
+
+    public LoadBalancerOptions LoadBalancer { get; set; } = new();
+}
+
+public sealed class GameServerEndpoint
+{
+    public string Name { get; set; } = null!;
+
+    public string BaseUrl { get; set; } = null!;
+}
+
+public sealed class LoadBalancerOptions
+{
+    public int RequestTimeoutSeconds { get; set; } = 10;
+
+    public int HealthCheckIntervalSeconds { get; set; } = 5;
+
+    public string Strategy { get; set; } = "RoundRobin";
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\GamePlatform.LoadBalancer.csproj
+================================================================================
+
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.10.0" />
+  </ItemGroup>
+
+</Project>
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\Health\ServerHealthMonitor.cs
+================================================================================
+
+using GamePlatform.LoadBalancer.Configuration;
+
+namespace GamePlatform.LoadBalancer.Health;
+
+public sealed class ServerHealthMonitor : BackgroundService
+{
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IConfiguration _configuration;
+    private readonly ILogger<ServerHealthMonitor> _logger;
+
+    private readonly List<ServerState> _servers = [];
+    private readonly object _sync = new();
+
+    public ServerHealthMonitor(
+        IHttpClientFactory httpClientFactory,
+        IConfiguration configuration,
+        ILogger<ServerHealthMonitor> logger)
+    {
+        _httpClientFactory = httpClientFactory;
+        _configuration = configuration;
+        _logger = logger;
+
+        var servers =
+            configuration
+                .GetSection("GameServers")
+                .Get<List<GameServerEndpoint>>()
+            ?? [];
+
+        foreach (var server in servers)
+        {
+            _servers.Add(new ServerState
+            {
+                Name = server.Name,
+                BaseUrl = server.BaseUrl,
+                Healthy = false
+            });
+        }
+    }
+
+    public IReadOnlyList<GameServerEndpoint> GetHealthyServers()
+    {
+        lock (_sync)
+        {
+            return _servers
+                .Where(x => x.Healthy)
+                .Select(x => new GameServerEndpoint
+                {
+                    Name = x.Name,
+                    BaseUrl = x.BaseUrl
+                })
+                .ToList();
+        }
+    }
+
+    protected override async Task ExecuteAsync(
+        CancellationToken stoppingToken)
+    {
+        var interval =
+            _configuration
+                .GetValue<int?>(
+                    "LoadBalancer:HealthCheckIntervalSeconds")
+            ?? 5;
+
+        // Perform an immediate health check rather than
+        // waiting for the first interval.
+        await CheckAllServers(stoppingToken);
+
+        using var timer = new PeriodicTimer(
+            TimeSpan.FromSeconds(interval));
+
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            await CheckAllServers(stoppingToken);
+        }
+    }
+
+    private async Task CheckAllServers(
+        CancellationToken cancellationToken)
+    {
+        var client =
+            _httpClientFactory.CreateClient("health");
+
+        foreach (var server in _servers)
+        {
+            try
+            {
+                using var response =
+                    await client.GetAsync(
+                        $"{server.BaseUrl.TrimEnd('/')}/health/ready",
+                        cancellationToken);
+
+                var healthy = response.IsSuccessStatusCode;
+
+                lock (_sync)
+                {
+                    server.Healthy = healthy;
+                }
+
+                if (!healthy)
+                {
+                    _logger.LogWarning(
+                        "Game server {Server} returned unhealthy status {StatusCode}.",
+                        server.Name,
+                        (int)response.StatusCode);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "Game server {Server} is healthy.",
+                        server.Name);
+                }
+            }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lock (_sync)
+                {
+                    server.Healthy = false;
+                }
+
+                _logger.LogWarning(
+                    ex,
+                    "Game server {Server} is unavailable.",
+                    server.Name);
+            }
+        }
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\Health\ServerState.cs
+================================================================================
+
+namespace GamePlatform.LoadBalancer.Health;
+
+public sealed class ServerState
+{
+    public required string Name { get; init; }
+
+    public required string BaseUrl { get; init; }
+
+    public bool Healthy { get; set; }
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\Program.cs
+================================================================================
+
+using GamePlatform.LoadBalancer.Configuration;
+using GamePlatform.LoadBalancer.Health;
+using GamePlatform.LoadBalancer.Routing;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.Configure<List<GameServerEndpoint>>(
+    builder.Configuration.GetSection("GameServers"));
+
+builder.Services.AddControllers();
+
+builder.Services.AddSingleton<IServerSelector, RoundRobinServerSelector>();
+
+builder.Services.AddSingleton<ServerHealthMonitor>();
+
+builder.Services.AddHttpClient("health", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(2);
+});
+
+builder.Services.AddHttpClient("proxy", client =>
+{
+    var timeout =
+        builder.Configuration
+            .GetValue<int?>("LoadBalancer:RequestTimeoutSeconds")
+        ?? 10;
+
+    client.Timeout = TimeSpan.FromSeconds(timeout);
+});
+
+builder.Services.AddHostedService(
+    provider => provider.GetRequiredService<ServerHealthMonitor>());
+
+var app = builder.Build();
+
+app.Use(async (context, next) =>
+{
+    var requestId =
+        context.Request.Headers["X-Request-Id"]
+            .FirstOrDefault()
+        ?? Guid.NewGuid().ToString("N");
+
+    context.Response.Headers["X-Request-Id"] = requestId;
+
+    await next();
+});
+
+app.MapControllers();
+
+app.Run();
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\Properties\launchSettings.json
+================================================================================
+
+{
+  "$schema": "http://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "LoadBalancer": {
+      "commandName": "Project",
+      "applicationUrl": "http://localhost:5000",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      }
+    }
+  }
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\Proxy\ProxyController.cs
+================================================================================
+
+using GamePlatform.LoadBalancer.Health;
+using GamePlatform.LoadBalancer.Routing;
+using Microsoft.AspNetCore.Mvc;
+using System.Diagnostics;
+
+namespace GamePlatform.LoadBalancer.Proxy;
+
+[ApiController]
+public sealed class ProxyController : ControllerBase
+{
+    private readonly ServerHealthMonitor _healthMonitor;
+    private readonly IServerSelector _selector;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ILogger<ProxyController> _logger;
+
+    public ProxyController(
+        ServerHealthMonitor healthMonitor,
+        IServerSelector selector,
+        IHttpClientFactory httpClientFactory,
+        ILogger<ProxyController> logger)
+    {
+        _healthMonitor = healthMonitor;
+        _selector = selector;
+        _httpClientFactory = httpClientFactory;
+        _logger = logger;
+    }
+
+    [HttpGet("{**path}")]
+    [HttpPost("{**path}")]
+    [HttpPut("{**path}")]
+    [HttpPatch("{**path}")]
+    [HttpDelete("{**path}")]
+    [HttpHead("{**path}")]
+    [HttpOptions("{**path}")]
+    public async Task Proxy(
+        string? path,
+        CancellationToken cancellationToken)
+    {
+        var servers = _healthMonitor.GetHealthyServers();
+
+        if (servers.Count == 0)
+        {
+            Response.StatusCode =
+                StatusCodes.Status503ServiceUnavailable;
+
+            await Response.WriteAsJsonAsync(
+                new
+                {
+                    error = "No healthy game servers available."
+                },
+                cancellationToken);
+
+            return;
+        }
+
+        var server = _selector.Select(servers);
+
+        var requestId =
+            Request.Headers["X-Request-Id"]
+                .FirstOrDefault()
+            ?? Guid.NewGuid().ToString("N");
+
+        var targetUrl =
+            $"{server.BaseUrl.TrimEnd('/')}/{path}";
+
+        if (Request.QueryString.HasValue)
+        {
+            targetUrl += Request.QueryString.Value;
+        }
+
+        using var client =
+            _httpClientFactory.CreateClient("proxy");
+
+        using var message = new HttpRequestMessage(
+            new HttpMethod(Request.Method),
+            targetUrl);
+
+        // Forward request body.
+        if (Request.ContentLength is > 0 ||
+            Request.Headers.ContainsKey("Transfer-Encoding"))
+        {
+            message.Content =
+                new StreamContent(Request.Body);
+        }
+
+        // Forward headers.
+        foreach (var header in Request.Headers)
+        {
+            if (header.Key.Equals(
+                    "Host",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (header.Key.Equals(
+                    "Content-Length",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (header.Key.Equals(
+                    "X-Request-Id",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            message.Headers.TryAddWithoutValidation(
+                header.Key,
+                header.Value.ToArray());
+        }
+
+        message.Headers.TryAddWithoutValidation(
+            "X-Request-Id",
+            requestId);
+
+        var started = Stopwatch.GetTimestamp();
+
+        try
+        {
+            _logger.LogInformation(
+                "FORWARD {Method} {Path} RequestId={RequestId} Server={Server} Target={TargetUrl}",
+                Request.Method,
+                path,
+                requestId,
+                server.Name,
+                targetUrl);
+
+            using var downstreamResponse =
+                await client.SendAsync(
+                    message,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
+
+            Response.StatusCode =
+                (int)downstreamResponse.StatusCode;
+
+            foreach (var header in downstreamResponse.Headers)
+            {
+                Response.Headers[header.Key] =
+                    header.Value.ToArray();
+            }
+
+            foreach (var header in
+                     downstreamResponse.Content.Headers)
+            {
+                if (header.Key.Equals(
+                        "Content-Length",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Response.Headers[header.Key] =
+                    header.Value.ToArray();
+            }
+
+            await downstreamResponse.Content.CopyToAsync(
+                Response.Body,
+                cancellationToken);
+
+            var elapsed =
+                Stopwatch.GetElapsedTime(started);
+
+            _logger.LogInformation(
+                "COMPLETED RequestId={RequestId} Server={Server} Status={StatusCode} DurationMs={DurationMs}",
+                requestId,
+                server.Name,
+                Response.StatusCode,
+                elapsed.TotalMilliseconds);
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            var elapsed =
+                Stopwatch.GetElapsedTime(started);
+
+            _logger.LogWarning(
+                "CANCELLED RequestId={RequestId} Server={Server} DurationMs={DurationMs}",
+                requestId,
+                server.Name,
+                elapsed.TotalMilliseconds);
+
+            throw;
+        }
+        catch (HttpRequestException ex)
+        {
+            var elapsed =
+                Stopwatch.GetElapsedTime(started);
+
+            _logger.LogWarning(
+                ex,
+                "DOWNSTREAM FAILURE RequestId={RequestId} Server={Server} DurationMs={DurationMs}",
+                requestId,
+                server.Name,
+                elapsed.TotalMilliseconds);
+
+            Response.StatusCode =
+                StatusCodes.Status502BadGateway;
+
+            await Response.WriteAsJsonAsync(
+                new
+                {
+                    error = "Game server unavailable.",
+                    requestId,
+                    server = server.Name
+                },
+                cancellationToken);
+        }
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.LoadBalancer\Routing\RoundRobinServerSelector.cs
+================================================================================
+
+using System.Threading;
+using GamePlatform.LoadBalancer.Configuration;
+
+namespace GamePlatform.LoadBalancer.Routing;
+
+public interface IServerSelector
+{
+    GameServerEndpoint Select(
+        IReadOnlyList<GameServerEndpoint> servers);
+}
+
+public sealed class RoundRobinServerSelector : IServerSelector
+{
+    private long _counter = -1;
+
+    public GameServerEndpoint Select(
+        IReadOnlyList<GameServerEndpoint> servers)
+    {
+        if (servers.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "No healthy game servers are available.");
+        }
+
+        var index =
+            (int)(
+                (ulong)Interlocked.Increment(ref _counter)
+                % (ulong)servers.Count);
+
+        return servers[index];
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.Tests\Concurrency\WalletConcurrencyTests.cs
+================================================================================
+
+using GamePlatform.GameServer.Domain;
+using GamePlatform.GameServer.Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
+
+namespace GamePlatform.Tests.Concurrency;
+
+public sealed class WalletConcurrencyTests
+{
+    [Fact]
+    public async Task LedgerBalanceShouldMatchWalletBalance()
+    {
+        var options = new DbContextOptionsBuilder<GameDbContext>()
+            .UseSqlite("Data Source=:memory:")
+            .Options;
+
+        await using var db = new GameDbContext(options);
+
+        await db.Database.OpenConnectionAsync();
+        await db.Database.EnsureCreatedAsync();
+
+        var wallet = new Wallet
+        {
+            Id = Guid.NewGuid(),
+            Balance = 100m,
+            Version = 1,
+            Type = GameServer.Domain.Enums.WalletType.Player,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        db.Wallets.Add(wallet);
+
+        db.LedgerEntries.Add(new LedgerEntry
+        {
+            Id = Guid.NewGuid(),
+            WalletId = wallet.Id,
+            Amount = 100m,
+            TransactionType =
+                GameServer.Domain.Enums.LedgerTransactionType.Deposit,
+            OperationId = Guid.NewGuid().ToString("N"),
+            IdempotencyKey = Guid.NewGuid().ToString("N"),
+            CreatedAt = DateTime.UtcNow
+        });
+
+        await db.SaveChangesAsync();
+
+        var ledgerBalance =
+            await db.LedgerEntries
+                .Where(x => x.WalletId == wallet.Id)
+                .SumAsync(x => x.Amount);
+
+        Assert.Equal(wallet.Balance, ledgerBalance);
+    }
+}
+
+
+================================================================================
+FILE: GamePlatform.Tests\GamePlatform.Tests.csproj
+================================================================================
+
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.12" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\GamePlatform.GameServer\GamePlatform.GameServer.csproj" />
+  </ItemGroup>
+
+</Project>
+
+
+================================================================================
+FILE: GamePlatform.Tests\UnitTest1.cs
+================================================================================
+
+namespace GamePlatform.Tests;
+
+public class UnitTest1
+{
+    [Fact]
+    public void Test1()
+    {
+
+    }
+}
+
+
